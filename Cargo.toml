@@ -1,0 +1,9 @@
+[package]
+name = "motd"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dirs = "5.0.1"
+rand = "0.8.5"
+termcolor = "1.4.1"
