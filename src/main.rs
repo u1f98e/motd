@@ -98,12 +98,38 @@ fn random_color(lightness_lower: f32, lightness_upper: f32) -> termcolor::Color 
 }
 
 fn main() -> io::Result<()> {
-    let msg_file = File::open(msg_file_path()).unwrap_or_else(|e| {
-        eprintln!("motd: failed to open message file: {e}");
-        std::process::exit(1);
-    });
+    let path = msg_file_path();
+    let msg_file = match File::open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            eprintln!(
+                "WARN: Message file '{}' does not exist, creating an empty file.",
+                path.display()
+            );
+            File::create_new(&path).unwrap_or_else(|e2| {
+                eprintln!(
+                    "motd: failed to create new message file '{}': {}",
+                    path.display(),
+                    e2
+                );
+                std::process::exit(1);
+            })
+        }
+        Err(e) => {
+            eprintln!(
+                "motd: failed to open message file '{}': {}",
+                path.display(),
+                e
+            );
+            std::process::exit(1);
+        }
+    };
 
     let mut lines = LineSeeker::new(msg_file).unwrap();
+    if lines.count() == 0 {
+        return Ok(());
+    }
+
     let index = rand::thread_rng().gen_range(0..lines.count());
     let msg = lines.get_line(index)?;
 
