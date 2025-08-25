@@ -5,22 +5,25 @@ use std::path::PathBuf;
 use rand::Rng;
 use termcolor::{ColorSpec, StandardStream, WriteColor};
 
-struct LineSeeker<R: Read + Seek> {
+struct EntrySeeker<R: Read + Seek> {
     reader: BufReader<R>,
     positions: Vec<usize>,
+    delimiter: u8,
 }
 
-impl<R> LineSeeker<R>
+const DELIMITER: u8 = b'%';
+
+impl<R> EntrySeeker<R>
 where
     R: Read + Seek,
 {
-    pub fn new(read: R) -> io::Result<LineSeeker<R>> {
+    pub fn new(read: R, delimiter: u8) -> io::Result<EntrySeeker<R>> {
         let mut reader = BufReader::new(read);
         let mut positions = Vec::new();
         let mut current_pos = 0;
         let mut _buf = Vec::new();
         loop {
-            let count = reader.read_until(b'\n', &mut _buf)?;
+            let count = reader.read_until(delimiter, &mut _buf)?;
             if count == 0 {
                 break;
             }
@@ -28,7 +31,11 @@ where
             current_pos += count;
         }
 
-        Ok(LineSeeker { reader, positions })
+        Ok(EntrySeeker {
+            reader,
+            positions,
+            delimiter,
+        })
     }
 
     pub fn count(&self) -> usize {
@@ -47,8 +54,14 @@ where
         self.reader.seek(SeekFrom::Start(*pos as u64))?;
 
         let mut buf = Vec::new();
-        self.reader.read_until(b'\n', &mut buf)?;
-        Ok(String::from_utf8(buf).expect(&format!("line {index} is not a valid utf8 string")))
+        self.reader.read_until(self.delimiter, &mut buf)?;
+        let mut entry =
+            String::from_utf8(buf).expect(&format!("line {index} is not a valid utf8 string"));
+        if entry.len() > 0 {
+            entry.truncate(entry.len() - 1);
+        }
+
+        Ok(entry.trim().to_owned())
     }
 }
 
@@ -125,7 +138,7 @@ fn main() -> io::Result<()> {
         }
     };
 
-    let mut lines = LineSeeker::new(msg_file).unwrap();
+    let mut lines = EntrySeeker::new(msg_file, DELIMITER).unwrap();
     if lines.count() == 0 {
         return Ok(());
     }
