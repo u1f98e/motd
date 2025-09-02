@@ -1,67 +1,163 @@
+mod color;
+mod parse;
+mod printer;
+
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 
 use rand::Rng;
-use termcolor::{ColorSpec, StandardStream, WriteColor};
+
+use crate::parse::Token;
+use crate::printer::{MessagePrinter, PrinterConfig};
+
+const ENTRY_DELIMITER: u8 = b'%';
+const ENTRY_DELIMITER_CHAR: char = ENTRY_DELIMITER as char;
+const COLOR_LIGHTNESS_LOWER: f32 = 0.5;
+const COLOR_LIGHTNESS_UPPER: f32 = 0.9;
+
+#[derive(Debug)]
+struct SeekPos {
+    pub start_pos: usize,
+    pub len: usize,
+    pub line_number: u32,
+}
+
+#[derive(Default, Debug)]
+struct Entry {
+    pub msg: String,
+    pub line_number: u32,
+}
 
 struct EntrySeeker<R: Read + Seek> {
     reader: BufReader<R>,
-    positions: Vec<usize>,
-    delimiter: u8,
+    entries: Vec<SeekPos>,
 }
-
-const DELIMITER: u8 = b'%';
 
 impl<R> EntrySeeker<R>
 where
     R: Read + Seek,
 {
-    pub fn new(read: R, delimiter: u8) -> io::Result<EntrySeeker<R>> {
+    pub fn new(read: R) -> io::Result<EntrySeeker<R>> {
         let mut reader = BufReader::new(read);
-        let mut positions = Vec::new();
-        let mut current_pos = 0;
-        let mut _buf = Vec::new();
+        let mut entries = Vec::new();
+        let mut entry_pos = 0;
+        let mut entry_len = 0;
+        let mut current_line = 0;
+        let mut buf = [0u8; 1024];
         loop {
-            let count = reader.read_until(delimiter, &mut _buf)?;
+            let count = reader.read(&mut buf)?;
             if count == 0 {
                 break;
             }
-            positions.push(current_pos);
-            current_pos += count;
+
+            let mut escape = false;
+            for byte in buf.iter().take(count) {
+                entry_len += 1;
+                match byte {
+                    b'\\' => {
+                        escape = true;
+                    }
+                    b'\n' => {
+                        current_line += 1;
+                        escape = false;
+                    }
+                    &ENTRY_DELIMITER => {
+                        if !escape {
+                            entries.push(SeekPos {
+                                start_pos: entry_pos,
+                                len: entry_len,
+                                line_number: current_line,
+                            });
+                            entry_pos += entry_len;
+                            entry_len = 0;
+                        }
+                        escape = false
+                    }
+                    _ => escape = false,
+                }
+            }
         }
 
-        Ok(EntrySeeker {
-            reader,
-            positions,
-            delimiter,
-        })
+        Ok(EntrySeeker { reader, entries })
     }
 
     pub fn count(&self) -> usize {
-        self.positions.len()
+        self.entries.len()
     }
 
-    pub fn get_line(&mut self, index: usize) -> io::Result<String> {
-        if self.positions.is_empty() {
-            return Ok(String::new());
+    pub fn entries(self) -> Entries<R> {
+        Entries::new(self)
+    }
+
+    pub fn get_entry(&mut self, index: usize) -> io::Result<Entry> {
+        if self.entries.is_empty() {
+            return Ok(Entry::default());
         }
 
-        let pos = self
-            .positions
+        let entry = self
+            .entries
             .get(index)
             .expect("index for line should be in range");
-        self.reader.seek(SeekFrom::Start(*pos as u64))?;
+        self.reader.seek(SeekFrom::Start(entry.start_pos as u64))?;
 
-        let mut buf = Vec::new();
-        self.reader.read_until(self.delimiter, &mut buf)?;
-        let mut entry =
-            String::from_utf8(buf).expect(&format!("line {index} is not a valid utf8 string"));
-        if entry.len() > 0 {
-            entry.truncate(entry.len() - 1);
+        let mut buf = vec![0u8; entry.len];
+        self.reader.read_exact(&mut buf)?;
+        let mut msg = String::from_utf8(buf).expect(&format!(
+            "Entry on line {} is not a valid utf8 string",
+            entry.line_number
+        ));
+        if msg.len() > 0 {
+            msg.truncate(msg.len() - 1); // Chop off delimiter
         }
+        msg = msg.trim().to_owned();
 
-        Ok(entry.trim().to_owned())
+        Ok(Entry {
+            msg,
+            line_number: entry.line_number,
+        })
+    }
+}
+
+struct Entries<R>
+where
+    R: Read + Seek,
+{
+    seeker: EntrySeeker<R>,
+    index: usize,
+}
+
+impl<R> Entries<R>
+where
+    R: Read + Seek,
+{
+    pub fn new(seeker: EntrySeeker<R>) -> Self {
+        Self { seeker, index: 0 }
+    }
+}
+
+impl<R> Iterator for Entries<R>
+where
+    R: Read + Seek,
+{
+    type Item = Result<Entry, io::Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.seeker.count() {
+            return None;
+        }
+        let result = Some(self.seeker.get_entry(self.index));
+        self.index += 1;
+        result
+    }
+
+    fn count(self) -> usize {
+        self.seeker.count()
+    }
+
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        self.index = n;
+        self.next()
     }
 }
 
@@ -73,53 +169,84 @@ fn msg_file_path() -> PathBuf {
         })
 }
 
-fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
-    let chroma = (1. - f32::abs(2. * l - 1.)) * s;
-    let h_prime = h * 6.; // H' = H / 60deg
-    let x = chroma * (1. - f32::abs(f32::rem_euclid(h_prime, 2.) - 1.)); // X = C * (1 - |H' mod 2 - 1|)
-    let (r1, g1, b1) = if 0. <= h_prime && h_prime < 1. {
-        (chroma, x, 0.)
-    } else if h_prime < 2. {
-        (x, chroma, 0.)
-    } else if h_prime < 3. {
-        (0., chroma, x)
-    } else if h_prime < 4. {
-        (0., x, chroma)
-    } else if h_prime < 5. {
-        (x, 0., chroma)
-    } else {
-        (chroma, 0., x)
-    };
-
-    let m = l - (chroma / 2.);
-    let r = (r1 + m) * 255.;
-    let g = (g1 + m) * 255.;
-    let b = (b1 + m) * 255.;
-    (r as u8, g as u8, b as u8)
-}
-
-/// Returns a [termcolor::Color] with a random hue, full saturation, and a lightness
-/// between the provided `lightness_lower` and `lightness_upper` bounds (minimum 0.0, maximum 1.0)
-fn random_color(lightness_lower: f32, lightness_upper: f32) -> termcolor::Color {
-    let mut rng = rand::thread_rng();
-    let (r, g, b) = hsl_to_rgb(
-        rng.gen_range(0.0..1.0),
-        1.0,
-        rng.gen_range(lightness_lower..lightness_upper),
+fn print_help() {
+    println!(
+        "Usage: motd [options]
+  -e, --entry <NUM>   Print entry NUM instead of a random entry.
+      --debug         Print error messages instead of suppressing them.
+      --validate      Check message file for parsing errors."
     );
-    termcolor::Color::Rgb(r, g, b)
+    #[cfg(feature = "image")]
+    println!(
+        "
+      --img-height    Set the height in columns to use for images, defaults to 8.
+      --img-width     Manually set the width for images, preserves the aspect ratio by default."
+    );
 }
 
-fn main() -> io::Result<()> {
-    let path = msg_file_path();
-    let msg_file = match File::open(&path) {
+#[derive(Default)]
+struct CliArgs {
+    pub debug: bool,
+    pub validate: bool,
+    pub entry: Option<u32>,
+    #[cfg(feature = "image")]
+    pub img_height: Option<u32>,
+    #[cfg(feature = "image")]
+    pub img_width: Option<u32>,
+}
+
+impl CliArgs {
+    pub fn from_args(mut args: std::env::Args) -> Self {
+        let mut value = Self::default();
+
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--help" => print_help(),
+                "--debug" => value.debug = true,
+                "--validate" => value.validate = true,
+                "-e" | "--entry" => {
+                    let Some(entry) = args.next().map(|a| a.parse().ok()) else {
+                        eprintln!("motd: --entry option requires a valid line number.");
+                        std::process::exit(1);
+                    };
+
+                    value.entry = entry;
+                }
+                #[cfg(feature = "image")]
+                "--img-height" => {
+                    let Some(entry) = args.next().map(|a| a.parse().ok()) else {
+                        eprintln!("motd: --img-height option requires a valid size.");
+                        std::process::exit(1);
+                    };
+
+                    value.img_height = entry;
+                }
+                #[cfg(feature = "image")]
+                "--img-width" => {
+                    let Some(entry) = args.next().map(|a| a.parse().ok()) else {
+                        eprintln!("motd: --img-width option requires a valid size.");
+                        std::process::exit(1);
+                    };
+
+                    value.img_width = entry;
+                }
+                _ => (),
+            }
+        }
+
+        value
+    }
+}
+
+fn open_msg_file(path: &Path) -> File {
+    match File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             eprintln!(
-                "WARN: Message file '{}' does not exist, creating an empty file.",
+                "motd: Message file '{}' does not exist, creating an empty file.",
                 path.display()
             );
-            File::create_new(&path).unwrap_or_else(|e2| {
+            File::create_new(path).unwrap_or_else(|e2| {
                 eprintln!(
                     "motd: failed to create new message file '{}': {}",
                     path.display(),
@@ -136,19 +263,84 @@ fn main() -> io::Result<()> {
             );
             std::process::exit(1);
         }
-    };
+    }
+}
 
-    let mut lines = EntrySeeker::new(msg_file, DELIMITER).unwrap();
-    if lines.count() == 0 {
+fn main() -> io::Result<()> {
+    // Process args
+    let args = CliArgs::from_args(std::env::args());
+    let msg_path = msg_file_path();
+    let msg_file = open_msg_file(&msg_path);
+
+    let mut entry_seeker = EntrySeeker::new(msg_file).unwrap();
+    if entry_seeker.count() == 0 {
+        if args.debug {
+            eprintln!(
+                "motd: Message file '{}' does not contain any entries.",
+                msg_path.display()
+            );
+        }
         return Ok(());
     }
 
-    let index = rand::thread_rng().gen_range(0..lines.count());
-    let msg = lines.get_line(index)?;
+    // Do file validation instead
+    if args.validate {
+        for entry in entry_seeker.entries() {
+            let entry = match entry {
+                Ok(en) => en,
+                Err(e) => {
+                    eprintln!("Validation error: failed to read entry: {e}");
+                    std::process::exit(1);
+                }
+            };
 
-    let mut stdout = StandardStream::stdout(termcolor::ColorChoice::Auto);
-    let _ = stdout.set_color(ColorSpec::new().set_fg(Some(random_color(0.5, 0.9))));
-    let _ = writeln!(&mut stdout, "{}", msg.trim());
+            let tokens = match parse::parse_message(&entry.msg) {
+                Ok(tokens) => tokens,
+                Err(e) => {
+                    eprintln!("Validation error on line {}: {}", entry.line_number, e);
+                    std::process::exit(1);
+                }
+            };
 
+            for token in tokens {
+                if let Token::Resource(p) = token {
+                    let path = Path::new(&p);
+                    if !path.exists() {
+                        eprintln!(
+                            "Resource '{}' doesn't exist (from line {})",
+                            path.display(),
+                            entry.line_number
+                        );
+                    }
+                }
+            }
+        }
+
+        return Ok(());
+    }
+
+    let entry = if let Some(entry) = args.entry {
+        if entry as usize >= entry_seeker.count() {
+            eprintln!(
+                "Requested entry exceeds entry count ({})",
+                entry_seeker.count()
+            );
+            std::process::exit(1);
+        }
+        entry_seeker.get_entry(entry.try_into().expect("Should have less than u32 entries"))?
+    } else {
+        let index = rand::thread_rng().gen_range(0..entry_seeker.count());
+        entry_seeker.get_entry(index)?
+    };
+
+    let printer = MessagePrinter::new(PrinterConfig {
+        debug: args.debug,
+
+        #[cfg(feature = "image")]
+        img_height: args.img_height,
+        #[cfg(feature = "image")]
+        img_width: args.img_width,
+    });
+    printer.process_entry(entry);
     Ok(())
 }
