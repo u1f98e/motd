@@ -1,4 +1,7 @@
-use std::{io::Write, path::Path};
+use std::{
+    io::{IsTerminal, Write},
+    path::Path,
+};
 
 use termcolor::{ColorChoice, ColorSpec, StandardStream, WriteColor};
 
@@ -28,12 +31,26 @@ impl MessagePrinter {
     fn print_formatted_text(&self, msg: &str, color_spec: &termcolor::ColorSpec) {
         if !msg.is_empty() {
             let mut stdout = StandardStream::stdout(ColorChoice::Auto);
-            let _ = stdout.set_color(color_spec);
+            if std::io::stdout().is_terminal() {
+                let _ = stdout.set_color(color_spec);
+            }
             let _ = writeln!(&mut stdout, "{}", msg.trim());
         }
     }
 
+    fn print_image_fallback(&self) {
+        println!("🖼️");
+    }
+
     fn print_image(&self, _path: &Path) {
+        #[cfg(not(feature = "image"))]
+        self.print_image_fallback();
+
+        if !std::io::stdout().is_terminal() {
+            self.print_image_fallback();
+            return;
+        }
+
         #[cfg(feature = "image")]
         {
             let conf = viuer::Config {
@@ -45,15 +62,12 @@ impl MessagePrinter {
             };
 
             if let Err(e) = viuer::print_from_file(_path, &conf) {
-                println!("🖼️");
+                self.print_image_fallback();
                 if self.config.debug {
                     eprintln!("motd: Error displaying image {}: {}", _path.display(), e);
                 }
             }
         }
-
-        #[cfg(not(feature = "image"))]
-        println!("🖼️");
     }
 
     pub fn process_entry(&self, entry: Entry) {
