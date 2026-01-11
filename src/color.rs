@@ -28,11 +28,11 @@ pub fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
 /// Returns a [termcolor::Color] with a random hue, full saturation, and a lightness
 /// between the provided `lightness_lower` and `lightness_upper` bounds (minimum 0.0, maximum 1.0)
 pub fn random_color(lightness_lower: f32, lightness_upper: f32) -> termcolor::Color {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let (r, g, b) = hsl_to_rgb(
-        rng.gen_range(0.0..1.0),
+        rng.random_range(0.0..1.0),
         1.0,
-        rng.gen_range(lightness_lower..lightness_upper),
+        rng.random_range(lightness_lower..lightness_upper),
     );
     termcolor::Color::Rgb(r, g, b)
 }

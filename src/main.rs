@@ -389,7 +389,7 @@ fn main() -> io::Result<()> {
 
         entry
     } else {
-        let index = rand::thread_rng().gen_range(0..entry_seeker.count());
+        let index = rand::rng().random_range(0..entry_seeker.count());
         entry_seeker.get_entry(index)?
     };
 
