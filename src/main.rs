@@ -27,11 +27,12 @@ struct SeekPos {
 struct Entry {
     pub msg: String,
     pub line_number: u32,
+    pub entry_number: usize,
 }
 
 struct EntrySeeker<R: Read + Seek> {
     reader: BufReader<R>,
-    entries: Vec<SeekPos>,
+    entry_positions: Vec<SeekPos>,
 }
 
 impl<R> EntrySeeker<R>
@@ -43,7 +44,8 @@ where
         let mut entries = Vec::new();
         let mut entry_pos = 0;
         let mut entry_len = 0;
-        let mut current_line = 0;
+        let mut current_line = 1;
+        let mut entry_line = None;
         let mut buf = [0u8; 1024];
         loop {
             let count = reader.read(&mut buf)?;
@@ -54,6 +56,11 @@ where
             let mut escape = false;
             for byte in buf.iter().take(count) {
                 entry_len += 1;
+
+                if entry_line.is_none() && !byte.is_ascii_whitespace() {
+                    entry_line = Some(current_line);
+                }
+
                 match byte {
                     b'\\' => {
                         escape = true;
@@ -67,10 +74,11 @@ where
                             entries.push(SeekPos {
                                 start_pos: entry_pos,
                                 len: entry_len,
-                                line_number: current_line,
+                                line_number: entry_line.unwrap_or(current_line),
                             });
                             entry_pos += entry_len;
                             entry_len = 0;
+                            entry_line = None;
                         }
                         escape = false
                     }
@@ -79,33 +87,41 @@ where
             }
         }
 
-        Ok(EntrySeeker { reader, entries })
+        Ok(EntrySeeker {
+            reader,
+            entry_positions: entries,
+        })
     }
 
     pub fn count(&self) -> usize {
-        self.entries.len()
+        self.entry_positions.len()
     }
 
     pub fn entries(self) -> Entries<R> {
         Entries::new(self)
     }
 
+    pub fn entry_positions(&'_ self) -> core::slice::Iter<'_, SeekPos> {
+        self.entry_positions.iter()
+    }
+
     pub fn get_entry(&mut self, index: usize) -> io::Result<Entry> {
-        if self.entries.is_empty() {
+        if self.entry_positions.is_empty() {
             return Ok(Entry::default());
         }
 
-        let entry = self
-            .entries
+        let seek_pos = self
+            .entry_positions
             .get(index)
             .expect("index for line should be in range");
-        self.reader.seek(SeekFrom::Start(entry.start_pos as u64))?;
+        self.reader
+            .seek(SeekFrom::Start(seek_pos.start_pos as u64))?;
 
-        let mut buf = vec![0u8; entry.len];
+        let mut buf = vec![0u8; seek_pos.len];
         self.reader.read_exact(&mut buf)?;
         let mut msg = String::from_utf8(buf).expect(&format!(
             "Entry on line {} is not a valid utf8 string",
-            entry.line_number
+            seek_pos.line_number
         ));
         if msg.len() > 0 {
             msg.truncate(msg.len() - 1); // Chop off delimiter
@@ -114,7 +130,8 @@ where
 
         Ok(Entry {
             msg,
-            line_number: entry.line_number,
+            line_number: seek_pos.line_number,
+            entry_number: index,
         })
     }
 }
@@ -173,6 +190,7 @@ fn print_help() {
     println!(
         "Usage: motd [options]
   -e, --entry <NUM>   Print entry NUM instead of a random entry.
+      --line <NUM>    Print entry on line NUM instead of a random entry (debugging only).
       --debug         Print error messages instead of suppressing them.
       --validate      Check message file for parsing errors."
     );
@@ -189,6 +207,7 @@ struct CliArgs {
     pub debug: bool,
     pub validate: bool,
     pub entry: Option<u32>,
+    pub line_num: Option<u32>,
     #[cfg(feature = "image")]
     pub img_height: Option<u32>,
     #[cfg(feature = "image")]
@@ -205,12 +224,21 @@ impl CliArgs {
                 "--debug" => value.debug = true,
                 "--validate" => value.validate = true,
                 "-e" | "--entry" => {
-                    let Some(entry) = args.next().map(|a| a.parse().ok()) else {
-                        eprintln!("motd: --entry option requires a valid line number.");
+                    let Some(entry) = args.next().and_then(|a| a.parse().ok()) else {
+                        eprintln!("motd: --entry option requires a valid entry number.");
                         std::process::exit(1);
                     };
 
-                    value.entry = entry;
+                    value.entry = Some(entry);
+                }
+                "--line" => {
+                    let Some(entry) = args.next().and_then(|a| a.parse().ok()) else {
+                        eprintln!("motd: --line option requires a valid line number.");
+                        std::process::exit(1);
+                    };
+
+                    println!("{entry:?}");
+                    value.line_num = Some(entry);
                 }
                 #[cfg(feature = "image")]
                 "--img-height" => {
@@ -266,6 +294,44 @@ fn open_msg_file(path: &Path) -> File {
     }
 }
 
+fn validate_file<R>(entry_seeker: EntrySeeker<R>) -> io::Result<()>
+where
+    R: std::io::Seek + std::io::Read,
+{
+    for entry in entry_seeker.entries() {
+        let entry = match entry {
+            Ok(en) => en,
+            Err(e) => {
+                eprintln!("Validation error: failed to read entry: {e}");
+                std::process::exit(1);
+            }
+        };
+
+        let tokens = match parse::parse_message(&entry.msg) {
+            Ok(tokens) => tokens,
+            Err(e) => {
+                eprintln!("Validation error on line {}: {}", entry.line_number, e);
+                std::process::exit(1);
+            }
+        };
+
+        for token in tokens {
+            if let Token::Resource(p) = token {
+                let path = Path::new(&p);
+                if !path.exists() {
+                    eprintln!(
+                        "Resource '{}' doesn't exist (from line {})",
+                        path.display(),
+                        entry.line_number
+                    );
+                }
+            }
+        }
+    }
+
+    return Ok(());
+}
+
 fn main() -> io::Result<()> {
     // Process args
     let args = CliArgs::from_args(std::env::args());
@@ -283,51 +349,45 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
-    // Do file validation instead
     if args.validate {
-        for entry in entry_seeker.entries() {
-            let entry = match entry {
-                Ok(en) => en,
-                Err(e) => {
-                    eprintln!("Validation error: failed to read entry: {e}");
-                    std::process::exit(1);
-                }
-            };
-
-            let tokens = match parse::parse_message(&entry.msg) {
-                Ok(tokens) => tokens,
-                Err(e) => {
-                    eprintln!("Validation error on line {}: {}", entry.line_number, e);
-                    std::process::exit(1);
-                }
-            };
-
-            for token in tokens {
-                if let Token::Resource(p) = token {
-                    let path = Path::new(&p);
-                    if !path.exists() {
-                        eprintln!(
-                            "Resource '{}' doesn't exist (from line {})",
-                            path.display(),
-                            entry.line_number
-                        );
-                    }
-                }
-            }
-        }
-
-        return Ok(());
+        // Do file validation instead
+        return validate_file(entry_seeker);
     }
 
-    let entry = if let Some(entry) = args.entry {
-        if entry as usize >= entry_seeker.count() {
+    let entry_num = if let Some(entry_num) = args.entry {
+        if entry_num as usize >= entry_seeker.count() {
             eprintln!(
                 "Requested entry exceeds entry count ({})",
                 entry_seeker.count()
             );
             std::process::exit(1);
         }
-        entry_seeker.get_entry(entry.try_into().expect("Should have less than u32 entries"))?
+        entry_seeker.get_entry(
+            entry_num
+                .try_into()
+                .expect("Should have less than u32 entries"),
+        )?
+    } else if let Some(line_num) = args.line_num {
+        // Find the entry which contains line_num, or saturate on the last entry
+        let mut entry_num = 0;
+        for (i, pos) in entry_seeker.entry_positions().enumerate() {
+            entry_num = i;
+            if pos.line_number >= line_num {
+                break;
+            }
+        }
+
+        if entry_num as usize >= entry_seeker.count() {
+            eprintln!("Line number exceeds message file line count");
+            std::process::exit(1);
+        }
+        let entry = entry_seeker.get_entry(entry_num)?;
+
+        if args.debug {
+            eprintln!("Line: {}\nEntry: {}", entry.line_number, entry.entry_number);
+        }
+
+        entry
     } else {
         let index = rand::thread_rng().gen_range(0..entry_seeker.count());
         entry_seeker.get_entry(index)?
@@ -341,6 +401,6 @@ fn main() -> io::Result<()> {
         #[cfg(feature = "image")]
         img_width: args.img_width,
     });
-    printer.process_entry(entry);
+    printer.process_entry(entry_num);
     Ok(())
 }
